@@ -8,7 +8,7 @@ from flask import Flask, render_template, request, redirect, url_for, send_from_
 from ultralytics import YOLO
 from transformers import pipeline
 from PIL import Image
-from fer import FER
+from fer.fer import FER
 from sklearn.cluster import KMeans
 
 
@@ -28,14 +28,14 @@ app = Flask(__name__)
 app.secret_key = "change-this-secret"
 
 
-# Load Models 
+
 YOLO_WEIGHTS = os.path.join(MODEL_DIR, "yolov8n.pt") 
-# If you don't place it manually, ultralytics may download automatically if you use "yolov8n.pt"
+
 person_detector = YOLO(YOLO_WEIGHTS if os.path.exists(YOLO_WEIGHTS) else "yolov8n.pt")
 
 gender_classifier = pipeline("image-classification", model="rizvandwiki/gender-classification")
 age_classifier = pipeline("image-classification", model="nateraw/vit-age-classifier")
-emotion_detector = FER(mtcnn=True)  # loaded for parity (not displayed by default)
+# emotion_detector = FER(mtcnn=True)  
 
 
 
@@ -47,7 +47,8 @@ def detect_persons(frame, model):
     results = model(frame, verbose=False)
     persons = []
     for box in results[0].boxes:
-        if int(box.cls[0]) == 0:  # 0 = person
+        if int(box.cls[0]) == 0: 
+            
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             persons.append((x1, y1, x2, y2))
     return persons
@@ -175,12 +176,33 @@ def get_video_metadata(video_path: str) -> dict:
     }
 
 
-def process_video(video_path: str, out_path: str, max_frames: int = 0):
+def fast_dominant_color_names(bgr_img, num_colors=2):
     """
-    Processes video and writes annotated output video.
-    Returns summary stats (counts).
-    max_frames=0 means process full video.
+    Very fast dominant color estimator (no KMeans).
     """
+    if bgr_img is None or bgr_img.size == 0:
+        return ["Unknown"]
+
+    small = cv2.resize(bgr_img, (32, 32), interpolation=cv2.INTER_AREA)
+    pixels = small.reshape(-1, 3)
+
+    step = max(1, len(pixels) // 400)
+    sample = pixels[::step]
+
+    med = np.median(sample, axis=0).astype(int)
+    colors = [tuple(med)]
+
+    mean = np.mean(sample, axis=0).astype(int)
+    colors.append(tuple(mean))
+
+    names = [color_name_from_bgr(c) for c in colors][:num_colors]
+    return list(dict.fromkeys(names)) 
+
+
+def process_video(video_path: str, out_path: str,
+                  analyze_every_n_frames: int = 3, 
+                  attrs_every_n_frames: int = 15,      
+                  yolo_imgsz: int = 640):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -198,26 +220,42 @@ def process_video(video_path: str, out_path: str, max_frames: int = 0):
         "colors": Counter(),
     }
 
+ 
+    attr_cache = {}
     processed = 0
+    frame_idx = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        annotated = frame.copy()
-        persons = detect_persons(frame, person_detector)
+        frame_idx += 1
+        annotated = frame
+
+        
+        if frame_idx % analyze_every_n_frames != 0:
+            out.write(annotated)
+            continue
+
+
+        results = person_detector.predict(frame, imgsz=yolo_imgsz, verbose=False)
+        persons = []
+        for box in results[0].boxes:
+            if int(box.cls[0]) == 0:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                persons.append((x1, y1, x2, y2))
+
         stats["persons_total"] += len(persons)
 
         for (x1, y1, x2, y2) in persons:
             x1 = max(0, x1); y1 = max(0, y1)
             x2 = min(width - 1, x2); y2 = min(height - 1, y2)
 
-            full_crop = frame[y1:y2, x1:x2]
-            if full_crop is None or full_crop.size == 0:
+            h = y2 - y1
+            if h <= 0:
                 continue
 
-            h = y2 - y1
             face_y2 = y1 + int(h * 0.35)
             torso_y1 = y1 + int(h * 0.25)
             torso_y2 = y1 + int(h * 0.75)
@@ -225,11 +263,27 @@ def process_video(video_path: str, out_path: str, max_frames: int = 0):
             face_crop = frame[y1:face_y2, x1:x2]
             torso_crop = frame[torso_y1:torso_y2, x1:x2]
 
-            gender = detect_gender(face_crop)
-            age = detect_age(face_crop)
-            colors = get_dress_colors(torso_crop, num_colors=2)
+  
+            key = (x1//10, y1//10, x2//10, y2//10)
+
+            gender = "Unknown"
+            age = "Unknown"
+
+            do_attrs = (frame_idx % attrs_every_n_frames == 0)
+
+            if not do_attrs and key in attr_cache:
+                gender, age = attr_cache[key]
+            else:
+                if face_crop is not None and face_crop.size > 0 and face_crop.shape[0] >= 30 and face_crop.shape[1] >= 30:
+                    gender = detect_gender(face_crop)
+                    age = detect_age(face_crop)
+
+                attr_cache[key] = (gender, age)
+
+            colors = fast_dominant_color_names(torso_crop, num_colors=2)
+
             dress_type = categorize_dress_type(y1, y2, x1, x2, torso_crop)
-            specific_dress = categorize_specific_dress(y1, y2, x1, x2, torso_crop, full_crop)
+            specific_dress = categorize_specific_dress(y1, y2, x1, x2, torso_crop, frame[y1:y2, x1:x2])
 
             stats["gender"][parse_label_prefix(gender)] += 1
             stats["age"][parse_label_prefix(age)] += 1
@@ -238,9 +292,8 @@ def process_video(video_path: str, out_path: str, max_frames: int = 0):
             for c in colors:
                 stats["colors"][c] += 1
 
+            # draw
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # Labels
             label_texts = [
                 f"Gender: {gender}",
                 f"Age: {age}",
@@ -248,7 +301,6 @@ def process_video(video_path: str, out_path: str, max_frames: int = 0):
                 f"Dress Type: {dress_type}",
                 f"Specific: {specific_dress}",
             ]
-
             for i, line in enumerate(label_texts):
                 cv2.putText(
                     annotated,
@@ -264,13 +316,10 @@ def process_video(video_path: str, out_path: str, max_frames: int = 0):
         out.write(annotated)
         processed += 1
 
-        if max_frames and processed >= max_frames:
-            break
-
     cap.release()
     out.release()
 
-    stats_out = {
+    return {
         "persons_total": stats["persons_total"],
         "gender": dict(stats["gender"]),
         "age": dict(stats["age"]),
@@ -279,7 +328,6 @@ def process_video(video_path: str, out_path: str, max_frames: int = 0):
         "colors": dict(stats["colors"]),
         "frames_processed": processed,
     }
-    return stats_out
 
 
 
@@ -313,7 +361,11 @@ def analyze():
     out_path = os.path.join(OUTPUT_DIR, out_name)
 
     meta = get_video_metadata(in_path)
-    stats = process_video(in_path, out_path, max_frames=0)
+    stats = process_video(in_path, out_path,
+                      analyze_every_n_frames=3, 
+                      attrs_every_n_frames=15,      
+                      yolo_imgsz=640)
+
 
     return render_template(
         "result.html",
